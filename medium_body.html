@@ -1,0 +1,265 @@
+<p><em>I took the most popular tracking algorithm, made it compute the
+math for all cameras in shared GPU batches — and stepped on three rakes
+along the way that anyone writing real-time PyTorch pipelines should
+know about.</em></p>
+<p><img
+src="https://raw.githubusercontent.com/sweetlhare/BatchGpuByteTrack/article-assets/fig7_arch_en.png"
+alt="Architecture: classic approach vs batched" /></p>
+<h2 id="the-problem-n-cameras--n-trackers--a-sad-cpu">The problem: N
+cameras = N trackers = a sad CPU</h2>
+<p>A typical production video-analytics setup: one GPU server, 8–32 RTSP
+streams coming in, YOLO detecting people/vehicles on every frame — and
+then you need tracking: stable object IDs from frame to frame.</p>
+<p>Detection is fine: YOLO batches beautifully, 16 frames go through one
+inference call. Then it gets interesting. Every popular Python tracking
+library — BoxMOT, Norfair, roboflow/trackers, the tracker built into
+ultralytics — is built the same way: <strong>one tracker instance per
+video stream, all math on the CPU</strong>. The official recipe for
+multiple cameras is "wrap each camera in its own thread/process."</p>
+<p>That works at 2–4 cameras. At 16, the Kalman filters, IoU matrices
+and track bookkeeping eat your cores faster than YOLO can detect: in our
+measurements, 16 streams of CPU ByteTrack cost <strong>104 ms per
+frame</strong> — against 6 ms for detection. The tracker that's supposed
+to be "lighter than the detector" becomes the pipeline bottleneck.</p>
+<p>The only solution with true cross-camera batching is NVIDIA
+DeepStream (nvtracker). But that means a GStreamer pipeline, C++
+plugins, YAML configs and a closed-source tracker core — a different
+weight class entirely if your whole pipeline is Python. (Detailed
+comparison at the end.)</p>
+<p>I wanted a third option: <strong>DeepStream-grade efficiency, but
+<code>pip install</code> and three files of PyTorch</strong>. That's how
+<a
+href="https://github.com/sweetlhare/BatchGpuByteTrack">BatchGpuByteTrack</a>
+came to be.</p>
+<h2 id="the-idea-a-tracker-as-a-batched-operation">The idea: a tracker
+as a batched operation</h2>
+<p>The key observation: ByteTrack's math batches just as well as a
+neural network does.</p>
+<ul>
+<li><strong>Kalman predict/update</strong> — small matrix
+multiplications (8×8). A thousand tracks is a <code>[1000, 8, 8]</code>
+tensor: one <code>torch.einsum</code> call instead of a thousand numpy
+calls.</li>
+<li><strong>IoU cost matrices</strong> — pairwise box intersections. All
+streams pack into one padded tensor <code>[S, M_max, N_max]</code> — a
+single kernel.</li>
+<li><strong>ReID embeddings</strong> — detection crops from all cameras
+go into one OSNet batch.</li>
+</ul>
+<p>What stays on the CPU is what genuinely belongs there: the Hungarian
+algorithm (<code>lap.lapjv</code> solves tens-by-tens matrices in
+microseconds — GPU LAP solvers pay off at millions of variables, not at
+our sizes) and track lifecycle management.</p>
+<p>The resulting pipeline: one batched GPU phase (predict + IoU + OSNet)
+→ one bulk download to CPU → per-stream parallel association → one
+batched GPU phase (update). All CPU↔︎GPU traffic is a fixed number of
+bulk copies per frame, independent of camera count.</p>
+<p>And the algorithm is faithful ByteTrack: the full three-stage
+association (including the signature "BYTE" recovery of low-confidence
+detections), a confirmation stage for new tracks, the same thresholds.
+Parity with the reference implementation is pinned down by tests.</p>
+<h2 id="then-came-the-rakes">Then came the rakes</h2>
+<p>The first version worked, but the profiler showed something odd: at
+16 streams, the GPU version beat the CPU by only 1.2x. The investigation
+turned into three separate stories.</p>
+<h3 id="rake-1-batched-code-with-a-per-stream-loop">Rake #1: "batched"
+code with a per-stream loop</h3>
+<p>A classic. Kalman <em>predict</em> was already batched — one
+operation for all tracks of all cameras. Kalman <em>update</em> was
+not:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># before: each stream pays its own upload, kernel, and download</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> stream_id <span class="kw">in</span> <span class="bu">range</span>(num_streams):</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    means, covs, meas <span class="op">=</span> collect_matched(stream_id)          <span class="co"># CPU</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    means_t <span class="op">=</span> torch.from_numpy(means).to(device)            <span class="co"># upload ×16</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    upd_means, upd_covs <span class="op">=</span> kalman.batch_update(means_t, ...) <span class="co"># kernel ×16</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    results[stream_id] <span class="op">=</span> upd_means.cpu().numpy()            <span class="co"># download ×16</span></span></code></pre></div>
+<p>Sixteen streams — 48 tiny GPU operations per frame. Each is
+microseconds of useful work wrapped in tens of microseconds of overhead:
+kernel launch, synchronization, a PCIe transaction.</p>
+<p>The fix is trivial — gather the matched pairs of <strong>all</strong>
+streams into one tensor:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># after: one upload, one kernel, one download — for all streams</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>entries, means, covs, meas <span class="op">=</span> collect_matched_all_streams()</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>upd_means, upd_covs <span class="op">=</span> kalman.batch_update(stack(means), stack(covs), stack(meas))</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>scatter_back(entries, upd_means.cpu().numpy())</span></code></pre></div>
+<p>The stage dropped from <strong>11.8 ms to 1.6 ms</strong>. The same
+trick for IoU matrices (a padded <code>[S, M_max, N_max]</code> batch
+instead of a loop) shaved another 5 ms:</p>
+<p><img
+src="https://raw.githubusercontent.com/sweetlhare/BatchGpuByteTrack/article-assets/fig4_profile_en.png"
+alt="Profile before and after" /></p>
+<p><img
+src="https://raw.githubusercontent.com/sweetlhare/BatchGpuByteTrack/article-assets/fig3_progress_en.png"
+alt="Three optimization steps" /></p>
+<p>The moral: if your "GPU-accelerated" code has a <code>for</code> loop
+over streams/objects with <code>.to(device)</code> inside, it's not GPU
+code — it's an overhead generator.</p>
+<h3 id="rake-2-uploading-frames-at-16-gbs-on-a-25-gbs-bus">Rake #2:
+uploading frames at 1.6 GB/s on a 25 GB/s bus</h3>
+<p>ReID needs the frames on the GPU. Micro-profiling showed: uploading
+16 frames of 720p (44 MB) took <strong>26.7 ms</strong> — that's 1.6
+GB/s on a PCIe 4.0 link capable of ~25.</p>
+<p>The culprit is pageable memory: a plain
+<code>torch.from_numpy(arr).to('cuda')</code> from a numpy array goes
+through the driver's intermediate staging buffer. The cure is a
+persistent pinned buffer of your own:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>buf <span class="op">=</span> torch.empty(F, H, W, <span class="dv">3</span>, dtype<span class="op">=</span>torch.uint8, pin_memory<span class="op">=</span><span class="va">True</span>)  <span class="co"># once</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>...</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i, frame <span class="kw">in</span> <span class="bu">enumerate</span>(frames):                       <span class="co"># every frame</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    buf[i].copy_(torch.from_numpy(frame))                <span class="co"># memcpy into pinned</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>imgs <span class="op">=</span> buf.to(device, non_blocking<span class="op">=</span><span class="va">True</span>)                 <span class="co"># DMA at full speed</span></span></code></pre></div>
+<p>While at it, all detection crops are now cut and resized in <strong>a
+single <code>torchvision.ops.roi_align</code> call</strong> over the
+uploaded frames — instead of a per-detection "cut crop → upload →
+resize" loop (the same anti-pattern as rake #1, just with images).</p>
+<h3 id="rake-3-fp16-and-300-milliseconds-per-new-batch-size">Rake #3:
+FP16 and 300 milliseconds per new batch size</h3>
+<p>The sneakiest one. We enabled FP16 inference for OSNet (embeddings
+tolerate it fine, 2x speed) — and test runs started showing inexplicable
+freezes: median feature extraction at 14 ms, but regular 300 ms
+frames.</p>
+<p>It turned out: <strong>cuDNN selects kernels per input shape, and
+under FP16 that selection costs ~300 ms for every NEW batch
+size</strong>. And the batch size is the number of detections in the
+frame — it changes every frame: 48 crops, 52, 47, 61... Every new number
+is a new freeze. Under FP32 the same warmup costs ~40 ms, which is why
+nobody notices it there.</p>
+<p>The cure is bucketing: pad the inference batch to a multiple of 32
+(drop the extra rows afterwards). The number of distinct shapes
+collapses to 3–4 per run, each warmed once — or all pre-warmed at
+initialization:</p>
+<p><img
+src="https://raw.githubusercontent.com/sweetlhare/BatchGpuByteTrack/article-assets/fig5_fp16_spikes_en.png"
+alt="FP16 spikes before and after bucketing" /></p>
+<p>If you have a PyTorch model in production receiving variable-sized
+input under autocast — check your p99 latency. You might be paying this
+tax right now.</p>
+<h2 id="the-results-numbers">The results: numbers</h2>
+<p>Everything is measured by two scripts from the repository,
+reproducible on any hardware. Rig: RTX 4090, PyTorch 2.13, 200 frames,
+synthetic load of 30 detections/stream/frame (a dense scene):</p>
+<p><img
+src="https://raw.githubusercontent.com/sweetlhare/BatchGpuByteTrack/article-assets/fig1_scaling_en.png"
+alt="CPU vs GPU scaling" /></p>
+<p><img
+src="https://raw.githubusercontent.com/sweetlhare/BatchGpuByteTrack/article-assets/fig2_speedup_en.png"
+alt="Speedup by stream count" /></p>
+<p>End-to-end with real YOLO on pedestrian video (8 streams): tracking
+at <strong>5.1 ms vs 31.8 ms</strong> on CPU (6.2x); with detection
+included — 91 FPS for a batch of 8 cameras.</p>
+<p>At 1–2 cameras the CPU wins: the GPU's fixed overhead doesn't pay off
+there.</p>
+<h3 id="reid">ReID</h3>
+<p>ReID changes the picture: 70–80% of the frame is OSNet inference —
+irreducible compute. Batched roi_align + pinned buffers + FP16 made
+feature extraction ~2.3x faster:</p>
+<p><img
+src="https://raw.githubusercontent.com/sweetlhare/BatchGpuByteTrack/article-assets/fig6_reid_en.png"
+alt="ReID before and after" /></p>
+<p>But no miracles: with ReID, the overall GPU-over-CPU win is 1.8x at 8
+streams (Amdahl's law — both sides pay comparably for the network while
+crop counts are small). Beyond that, either <code>reid_interval</code>
+(features every K-th frame — tracks live on smoothed embeddings in
+between) or TensorRT, which is on the roadmap.</p>
+<h2 id="what-did-not-work-and-why-its-in-the-repo">What did NOT work
+(and why it's in the repo)</h2>
+<ul>
+<li><strong>Batched LAPJV for the Hungarian step</strong> —
+parallelizing the solve of tiny matrices is pointless; thread overhead
+exceeds the solve.</li>
+<li><strong>torch.compile kernel fusion</strong> — dynamic shapes (track
+counts change every frame) trigger recompilations that eat the entire
+gain. We'll revisit after moving Kalman state into resident GPU tensors
+(which makes shapes static).</li>
+<li><strong>Hungarian on GPU</strong> — GPU LAP implementations pay off
+from millions of variables; our matrices are tens-by-tens.</li>
+</ul>
+<p>All three dead ends are documented in
+<code>docs/optimization_guide.md</code>.</p>
+<h2 id="comparison-with-nvidia-deepstream-nvtracker">Comparison with
+NVIDIA DeepStream (nvtracker)</h2>
+<p>The only serious counterpart in terms of cross-camera batching. A
+point-by-point comparison:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>DeepStream nvtracker</th>
+<th>BatchGpuByteTrack</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Algorithms</td>
+<td>IOU, NvSORT, NvDeepSORT, NvDCF, MaskTracker (SAM2)</td>
+<td>ByteTrack (+ OSNet ReID)</td>
+</tr>
+<tr>
+<td>Stream batching</td>
+<td>Yes, all streams in one call</td>
+<td>Yes, all streams in shared GPU batches</td>
+</tr>
+<tr>
+<td>Integration</td>
+<td>GStreamer pipeline, C++ plugin, YAML configs</td>
+<td><code>pip install</code>, ~10 lines of Python</td>
+</tr>
+<tr>
+<td>Detector</td>
+<td>Inside the DeepStream pipeline (nvinfer)</td>
+<td>Any: numpy <code>[N, 5]</code> in</td>
+</tr>
+<tr>
+<td>Platform</td>
+<td>NVIDIA dGPU / Jetson + the DeepStream stack</td>
+<td>Any CUDA GPU + PyTorch; CPU mode included</td>
+</tr>
+<tr>
+<td>ReID</td>
+<td>TensorRT models</td>
+<td>OSNet (FP16), or your own embeddings via the API</td>
+</tr>
+<tr>
+<td>Openness</td>
+<td>Plugin source available; tracker core is a closed binary</td>
+<td>100% open source, MIT</td>
+</tr>
+<tr>
+<td>What we lack</td>
+<td>NvDCF (visual tracking between detections), 3D multi-view,
+sub-batching, PVA on Jetson</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>Bottom line: if you already live in the DeepStream ecosystem, or you
+need NvDCF / Jetson specifics — take nvtracker, it's more mature. If
+your pipeline is Python/PyTorch, your detector is your own, and you want
+to read and modify your tracker's code — that's what BatchGpuByteTrack
+is for.</p>
+<h2 id="try-it">Try it</h2>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/sweetlhare/BatchGpuByteTrack.git</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> BatchGpuByteTrack <span class="kw">&amp;&amp;</span> <span class="ex">pip</span> install <span class="at">-r</span> requirements.txt</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> <span class="at">-m</span> pytest tests/ <span class="at">-q</span>          <span class="co"># 64 tests</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> tools/benchmark_comparison.py <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--video</span> test_videos/6387-191695740_medium.mp4 <span class="at">--streams</span> 1,4,8,16 <span class="at">--device</span> cuda</span></code></pre></div>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> bytetrack <span class="im">import</span> BatchGPUTracker, TrackerConfig</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>tracker <span class="op">=</span> BatchGPUTracker(num_streams<span class="op">=</span><span class="dv">8</span>, config<span class="op">=</span>TrackerConfig(device<span class="op">=</span><span class="st">&#39;cuda&#39;</span>))</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>tracks <span class="op">=</span> tracker.update(batch_detections)   <span class="co"># a list of numpy [N,5], one per stream</span></span></code></pre></div>
+<p>Repository: <strong><a
+href="https://github.com/sweetlhare/BatchGpuByteTrack">https://github.com/sweetlhare/BatchGpuByteTrack</a></strong>
+— tests, benchmarks, full documentation and the optimization roadmap
+inside. Issues and PRs welcome — measurements on other GPUs and real
+multi-camera workloads are especially interesting.</p>
+<hr />
+<p><em>Built on <a
+href="https://github.com/FoundationVision/ByteTrack">ByteTrack</a>
+(Zhang et al., ECCV 2022) and <a
+href="https://github.com/KaiyangZhou/deep-person-reid">OSNet</a> (Zhou
+et al., ICCV 2019), MIT license.</em></p>
