@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Outputs
+outputs/
+benchmark_results/
+*.mp4
+!test_videos/*.mp4
+*.avi
+*.log
+checkpoints/
+
+# Model weights (downloaded on demand)
+*.pt
+*.pth
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Local backups
+*.bundle

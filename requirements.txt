@@ -1,0 +1,16 @@
+# Core package dependencies (see also setup.py)
+torch>=1.13
+torchvision
+numpy
+scipy
+lap
+opencv-python
+
+# Examples / benchmarks (YOLO detector)
+ultralytics
+
+# Fallback source for OSNet pretrained weights (Google Drive)
+gdown
+
+# Tests
+pytest
